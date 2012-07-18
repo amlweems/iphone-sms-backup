@@ -56,7 +56,7 @@ if sys.version_info[:2] == (2, 6):
 
 # Global variables
 ORIG_DB = 'test.db'
-COPY_DB = None
+handles = dict()
 
 def setup_and_parse(parser):
     """
@@ -99,19 +99,7 @@ def setup_and_parse(parser):
     output_group.add_argument("-o", "--output", dest="output", metavar="FILE",
             help="Name of output file. Optional. Default "
                  "(if not present): Output to STDOUT.")
-                 
-    output_group.add_argument("-e", "--email", action="append",
-            dest="emails", metavar="EMAIL",
-            help="Limit output to iMessage messages to/from this email "
-                 "address. Can be used multiple times. Optional. Default (if "
-                 "not present): All iMessages included.")
-    
-    output_group.add_argument("-p", "--phone", action="append",
-            dest="numbers", metavar="PHONE",
-            help="Limit output to sms messages to/from this phone number. "
-                 "Can be used multiple times. Optional. Default (if "
-                 "not present): All messages from all numbers included.")
-    
+
     output_group.add_argument("--no-header", dest="header", 
             action="store_false", default=True, help="Don't print header "
             "row for 'human' or 'csv' formats. Optional. Default (if not "
@@ -239,31 +227,6 @@ def find_sms_db():
         path = None
     return path
 
-def copy_sms_db(db):
-    """Copy db to a tmp file, and return filename of copy."""
-    try:
-        orig = open(db, 'rb')
-    except:
-        logging.error("Unable to open DB file: %s" % db)
-        sys.exit(1)
-    
-    try:
-        copy = tempfile.NamedTemporaryFile(delete=False)
-    except:
-        logging.error("Unable to make tmp file.")
-        orig.close()
-        sys.exit(1)
-        
-    try:
-        shutil.copyfileobj(orig, copy)
-    except:
-        logging.error("Unable to copy DB.")
-        sys.exit(1)
-    finally:
-        orig.close()
-        copy.close()
-    return copy.name
-
 def alias_map(aliases):
     """
     Convert .ini-style aliases to dict.
@@ -285,81 +248,37 @@ def alias_map(aliases):
             amap[key] = alias.decode('utf-8')
     return amap
 
-def build_msg_query(numbers, emails):
+def build_msg_query():
     """
     Build the query for SMS and iMessage messages.
     
-    If `numbers` or `emails` is not None, that means we're querying for a
-    subset of messages. Phone number is in `address` field for SMS messages,
-    and in `madrid_handle` for iMessage. Email is only in `madrid_handle`.
-    
+    In iOS 6, Apple changed the way the addresses are stored. They only store
+    a reference to the address in the message table. The reference is the `rowid`
+    of the actual `id` in the handle table. Because of this change, we remove the
+    ability to filter by number for now.
+
     Because of inconsistently formatted phone numbers, we run both passed-in
     numbers and numbers in DB through trunc() before comparing them.
     
-    If `numbers` is None, then we select all messages.
-    
-    Returns: query (string), params (tuple)
+    Returns: query (string)
     """
     query = """
 SELECT 
     rowid, 
     date, 
-    address, 
-    text, 
-    flags, 
-    group_id, 
-    madrid_handle, 
-    madrid_flags,
-    madrid_error,
-    is_madrid, 
-    madrid_date_read,
-    madrid_date_delivered
+    handle_id,
+    text,
+    is_from_me
 FROM message """
-    # Build up the where clause, if limiting query by phone.
-    params = []
-    or_clauses = []
-    if numbers:
-        for n in numbers:
-            or_clauses.append("TRUNC(address) = ?")
-            or_clauses.append("TRUNC(madrid_handle) = ?")
-            params.extend([trunc(n), trunc(n)])
-    if emails:
-        for e in emails:
-            or_clauses.append("madrid_handle = ?")
-            params.append(e)
-    if or_clauses:
-        where = "\nWHERE " + "\nOR ".join(or_clauses)
-        query = query + where
     query = query + "\nORDER by rowid"
-    return query, tuple(params)
+    return query
 
-def fix_imessage_date(seconds):
+def find_date(row):
     """
-    Convert seconds to unix epoch time.
-    
-    iMessage dates are not standard unix time.  They begin at midnight on 
-    2001-01-01, instead of the usual 1970-01-01.
-    
-    To convert to unix time, add 978,307,200 seconds!
-    
-    Source: http://d.hatena.ne.jp/sak_65536/20111017/1318829688
-    (Thanks, Google Translate!)
+        Return date for iMessage.
     """
-    return seconds + 978307200
-
-def imessage_date(row):
-    """
-    Return date for iMessage.
-    
-    iMessage messages have 2 dates: madrid_date_read and
-    madrid_date_delivered. Only one is set for each message, so find the
-    non-zero one, fix it so it is standard unix time, and return it.
-    """
-    if row['madrid_date_read'] == 0:
-        im_date = row['madrid_date_delivered']
-    else:
-        im_date = row['madrid_date_read']
-    return fix_imessage_date(im_date)
+    im_date = row['date']
+    return im_date + 978307200
 
 def convert_date(unix_date, format):
     """Convert unix epoch time string to formatted date string."""
@@ -367,74 +286,40 @@ def convert_date(unix_date, format):
     ds = dt.strftime(format)
     return ds.decode('utf-8')
 
-def convert_address_imessage(row, me, alias_map):
+def convert_address(row, me, alias_map):
     """
-    Find the iMessage address in row (a sqlite3.Row) and return a tuple of
-    address strings: (from_addr, to_addr).
+    In iOS 6, Apple introduced a much simpler database. Find the iCloud
+    handle_id in row (a sqlite3.Row) and return a tuple of address
+    strings: (from_addr, to_addr).
     
     In an iMessage message, the address could be an email or a phone number,
-    and is found in the `madrid_handle` field.
+    and is found by looking up the `handle_id` field in the handle table.
     
     Next, look for alias in alias_map.  Otherwise, use formatted address.
     
-    Use `madrid_flags` to determine direction of the message.  (See wiki
-    page for Meaning of FLAGS fields discussion.)
+    Use `is_from_me` to determine direction of the message.
         
     """
-    incoming_flags = (12289, 77825)
-    outgoing_flags = (36869, 102405)
+    global handles
     
     if isinstance(me, str): 
         me = me.decode('utf-8')
         
     # If madrid_handle is phone number, have to truncate it.
-    email_match = re.search('@', row['madrid_handle'])
-    if email_match:
-        handle = row['madrid_handle']
-    else:
-        handle = trunc(row['madrid_handle'])
+    handle = handles[row['handle_id']]
+    email_match = re.search('@', handle)
+    if not email_match:
+        handle = trunc(handle)
     
     if handle in alias_map:
         other = alias_map[handle]
     else:
-        other = format_address(row['madrid_handle'])
-        
-    if row['madrid_flags'] in incoming_flags:
-        from_addr = other
-        to_addr = me
-    elif row['madrid_flags'] in outgoing_flags:
-        from_addr = me
-        to_addr = other
-        
-    return (from_addr, to_addr)
+        other = format_address(handle)
 
-def convert_address_sms(row, me, alias_map):
-    """
-    Find the sms address in row (a sqlite3.Row) and return a tuple of address
-    strings: (from_addr, to_addr). 
-    
-    In an SMS message, the address is always a phone number and is found in
-    the `address` field.
-    
-    Next, look for alias in alias_map.  Otherwise, use formatted address.
-    
-    Use `flags` to determine direction of the message:
-        2 = 'incoming'
-        3 = 'outgoing'
-    """
-    if isinstance(me, str): 
-        me = me.decode('utf-8')
-    
-    tr_address = trunc(row['address'])
-    if tr_address in alias_map:
-        other = alias_map[tr_address]
-    else:
-        other = format_phone(row['address'])
-        
-    if row['flags'] == 2:
+    if row['is_from_me'] == 0:
         from_addr = other
         to_addr = me
-    elif row['flags'] == 3:
+    elif row['is_from_me'] == 1:
         from_addr = me
         to_addr = other
         
@@ -450,70 +335,6 @@ def clean_text_msg(txt):
     """
     txt = txt or ''
     return txt.replace("\015","\n")
-
-def skip_sms(row):
-    """Return True, if sms row should be skipped."""
-    retval = False
-    if row['flags'] not in (2, 3):
-        logging.info("Skipping msg (%s) not sent. Address: %s. Text: %s." % \
-                        (row['rowid'], row['address'], row['text']))
-        retval = True
-    elif not row['address']:
-        logging.info("Skipping msg (%s) without address. "
-                        "Text: %s" % (row['rowid'], row['text']))
-        retval = True
-    elif not row['text']:
-        logging.info("Skipping msg (%s) without text. Address: %s" % \
-                        (row['rowid'], row['address']))
-        retval = True
-    return retval
-
-def skip_imessage(row):
-    """
-    Return True, if iMessage row should be skipped.
-    
-    I whitelist madrid_flags values that I understand:
-    
-         36869   Sent from iPhone to SINGLE PERSON (address)
-        102405   Sent to SINGLE PERSON (text contains email, phone, or url)
-         12289   Received by iPhone
-         77825   Received (text contains email, phone, or url)
-    
-    Don't handle iMessage Group chats:
-        
-         32773   Sent from iPhone to GROUP
-         98309   Sent to GROUP (text contains email, phone or url)
-     
-    See wiki page on FLAGS fields for more details:
-        
-    """
-    flags_group_msgs = (32773, 98309)
-    flags_whitelist = (36869, 102405, 12289, 77825)
-    retval = False
-    if row['madrid_error'] != 0:
-        logging.info("Skipping msg (%s) with error code %s. Address: %s. "
-                        "Text: %s" % (row['rowid'], row['madrid_error'], 
-                        row['address'], row['text']))
-        retval = True
-    elif row['madrid_flags'] in flags_group_msgs:
-        logging.info("Skipping msg (%s). Don't handle iMessage group chat. " 
-                     "Text: %s" % (row['rowid'], row['text']))
-        retval = True
-    elif row['madrid_flags'] not in flags_whitelist:
-        logging.info("Skipping msg (%s). Don't understand madrid_flags: %s. " 
-                        "Text: %s" % (row['rowid'], row['madrid_flags'], 
-                        row['text']))
-        retval = True
-    elif not row['madrid_handle']:
-        logging.info("Skipping msg (%s) without address. "
-                        "(Probably iMessage group chat.) "
-                        "Text: %s" % (row['rowid'], row['text']))
-        retval = True
-    elif not row['text']:
-        logging.info("Skipping msg (%s) without text. Address: %s" % \
-                        (row['rowid'], row['address']))
-        retval = True
-    return retval
 
 def msgs_human(messages, header):
     """
@@ -609,33 +430,28 @@ def main():
         else:
             logging.basicConfig(level=logging.INFO)
         
-        global ORIG_DB, COPY_DB 
+        global ORIG_DB 
         ORIG_DB = args.db_file or find_sms_db()
-        COPY_DB = copy_sms_db(ORIG_DB)
         aliases = alias_map(args.aliases)
-        query, params = build_msg_query(args.numbers, args.emails)
+        query = build_msg_query()
         conn = None
 
         try:
-            conn = sqlite3.connect(COPY_DB)
+            conn = sqlite3.connect(ORIG_DB)
             conn.row_factory = sqlite3.Row
             conn.create_function("TRUNC", 1, trunc)
             cur = conn.cursor()
-            cur.execute(query, params)
+            cur.execute("SELECT rowid, id FROM handle")
+            for row in cur:
+                handles.update({row['rowid']:row['id']})
+            cur.execute(query)
             logging.debug("Run query: %s" % (query))
-            logging.debug("With query params: %s" % (params,))
-
+            
             messages = []
             for row in cur:
-                if row['is_madrid'] == 1:
-                    if skip_imessage(row): continue
-                    im_date = imessage_date(row)
-                    fmt_date = convert_date(im_date, args.date_format)
-                    fmt_from, fmt_to = convert_address_imessage(row, args.identity, aliases)
-                else:
-                    if skip_sms(row): continue
-                    fmt_date = convert_date(row['date'], args.date_format)
-                    fmt_from, fmt_to = convert_address_sms(row, args.identity, aliases)
+                im_date = find_date(row)
+                fmt_date = convert_date(im_date, args.date_format)
+                fmt_from, fmt_to = convert_address(row, args.identity, aliases)
                 msg = {'date': fmt_date,
                        'from': fmt_from,
                        'to': fmt_to,
@@ -645,15 +461,11 @@ def main():
             output(messages, args.output, args.format, args.header)
 
         except sqlite3.Error as e:
-            logging.error("Unable to access %s: %s" % (COPY_DB, e))
+            logging.error("Unable to access %s: %s" % (ORIG_DB, e))
             sys.exit(1)
         finally:
             if conn:
                 conn.close()
-            if COPY_DB:
-                os.remove(COPY_DB)
-                logging.debug("Deleted COPY_DB: %s" % COPY_DB)
-
     
 if __name__ == '__main__':
     main()
